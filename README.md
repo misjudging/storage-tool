@@ -22,6 +22,8 @@ This compiles:
 
 ## Run
 
+Run `storage_tool.exe` as **Administrator** for full-drive scans.
+
 Double-click `storage_tool.exe`, then:
 
 1. Set how many top files you want.
