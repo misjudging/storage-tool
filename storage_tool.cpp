@@ -9,12 +9,15 @@
 #include <filesystem>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
 
 constexpr int IDC_TOP_LABEL = 100;
 constexpr int IDC_TOP_EDIT = 101;
+constexpr int IDC_MODE_FILES = 102;
+constexpr int IDC_MODE_FOLDERS = 103;
 constexpr int IDC_DRIVE_BASE = 1000;
 constexpr int IDC_LISTVIEW = 2000;
 constexpr int IDC_STATUS = 3000;
@@ -34,6 +37,8 @@ struct ScanResult {
 struct AppState {
     HWND hwnd{};
     HWND topEdit{};
+    HWND modeFiles{};
+    HWND modeFolders{};
     HWND listView{};
     HWND statusLabel{};
     std::vector<HWND> driveButtons;
@@ -61,6 +66,8 @@ std::wstring format_size(std::uintmax_t size) {
 
 void set_controls_enabled(bool enabled) {
     EnableWindow(g_app.topEdit, enabled ? TRUE : FALSE);
+    EnableWindow(g_app.modeFiles, enabled ? TRUE : FALSE);
+    EnableWindow(g_app.modeFolders, enabled ? TRUE : FALSE);
     for (HWND btn : g_app.driveButtons) {
         EnableWindow(btn, enabled ? TRUE : FALSE);
     }
@@ -176,12 +183,87 @@ std::vector<FileEntry> scan_top_files(const std::wstring& drive, int topN, std::
     return result;
 }
 
+std::vector<FileEntry> scan_top_folders(const std::wstring& drive, int topN, std::wstring& err) {
+    std::unordered_map<std::wstring, std::uintmax_t> folderSizes;
+
+    std::error_code ec;
+    fs::recursive_directory_iterator it(
+        fs::path(drive),
+        fs::directory_options::skip_permission_denied,
+        ec
+    );
+    fs::recursive_directory_iterator end;
+
+    if (ec || it == end) {
+        err = L"Could not access selected drive.";
+        return {};
+    }
+
+    while (it != end) {
+        const auto& entry = *it;
+
+        std::error_code symlinkEc;
+        if (entry.is_symlink(symlinkEc)) {
+            it.disable_recursion_pending();
+        }
+
+        std::error_code statusEc;
+        if (entry.is_regular_file(statusEc) && !statusEc) {
+            std::error_code sizeEc;
+            auto size = entry.file_size(sizeEc);
+            if (!sizeEc) {
+                fs::path folder = entry.path().parent_path();
+                while (!folder.empty()) {
+                    folderSizes[folder.lexically_normal().wstring()] += static_cast<std::uintmax_t>(size);
+                    if (folder == folder.root_path()) {
+                        break;
+                    }
+                    folder = folder.parent_path();
+                }
+            }
+        }
+
+        std::error_code incEc;
+        it.increment(incEc);
+        if (incEc) {
+            incEc.clear();
+        }
+    }
+
+    // Root drive is always largest and not very useful in output.
+    folderSizes.erase(fs::path(drive).lexically_normal().wstring());
+
+    std::vector<FileEntry> result;
+    result.reserve(folderSizes.size());
+    for (const auto& kv : folderSizes) {
+        result.push_back(FileEntry{kv.first, kv.second});
+    }
+
+    std::sort(result.begin(), result.end(), [](const FileEntry& a, const FileEntry& b) {
+        return a.size > b.size;
+    });
+    if (static_cast<int>(result.size()) > topN) {
+        result.resize(topN);
+    }
+    return result;
+}
+
+struct ScanRequest {
+    std::wstring drive;
+    int topN;
+    bool foldersMode;
+};
+
 DWORD WINAPI scan_worker(LPVOID param) {
-    auto* request = static_cast<std::pair<std::wstring, int>*>(param);
+    auto* request = static_cast<ScanRequest*>(param);
     auto* out = new ScanResult{};
-    out->drive = request->first;
+    out->drive = request->drive;
     try {
-        out->files = scan_top_files(request->first, request->second, out->error);
+        if (request->foldersMode) {
+            out->files = scan_top_folders(request->drive, request->topN, out->error);
+        } else {
+            out->files = scan_top_files(request->drive, request->topN, out->error);
+        }
     } catch (const fs::filesystem_error&) {
         out->error = L"Filesystem error while scanning. Try a smaller folder first.";
     } catch (const std::exception&) {
@@ -210,9 +292,11 @@ void start_scan(const std::wstring& drive) {
     g_app.scanning = true;
     set_controls_enabled(false);
     ListView_DeleteAllItems(g_app.listView);
-    SetWindowTextW(g_app.statusLabel, (L"Scanning " + drive + L" ...").c_str());
+    bool foldersMode = (SendMessageW(g_app.modeFolders, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    std::wstring modeText = foldersMode ? L"folders" : L"files";
+    SetWindowTextW(g_app.statusLabel, (L"Scanning " + modeText + L" on " + drive + L" ...").c_str());
 
-    auto* payload = new std::pair<std::wstring, int>(drive, topN);
+    auto* payload = new ScanRequest{drive, topN, foldersMode};
     CreateThread(nullptr, 0, scan_worker, payload, 0, nullptr);
 }
 
@@ -257,8 +341,30 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 nullptr
             );
 
+            g_app.modeFiles = CreateWindowW(
+                L"BUTTON",
+                L"Largest Files",
+                WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+                170, 44, 110, 22,
+                hwnd,
+                reinterpret_cast<HMENU>(IDC_MODE_FILES),
+                nullptr,
+                nullptr
+            );
+            g_app.modeFolders = CreateWindowW(
+                L"BUTTON",
+                L"Largest Folders",
+                WS_CHILD | WS_VISIBLE | BS_AUTORADIOBUTTON,
+                286, 44, 130, 22,
+                hwnd,
+                reinterpret_cast<HMENU>(IDC_MODE_FOLDERS),
+                nullptr,
+                nullptr
+            );
+            SendMessageW(g_app.modeFiles, BM_SETCHECK, BST_CHECKED, 0);
+
             auto drives = get_drives();
-            int x = 170;
+            int x = 430;
             int y = 40;
             for (size_t i = 0; i < drives.size(); ++i) {
                 HWND btn = CreateWindowW(
@@ -301,6 +407,8 @@ LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             );
 
             SendMessageW(g_app.topEdit, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            SendMessageW(g_app.modeFiles, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
+            SendMessageW(g_app.modeFolders, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             SendMessageW(g_app.listView, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             SendMessageW(g_app.statusLabel, WM_SETFONT, reinterpret_cast<WPARAM>(font), TRUE);
             return 0;
