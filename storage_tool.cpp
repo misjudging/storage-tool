@@ -5,6 +5,7 @@
 #include <commctrl.h>
 
 #include <algorithm>
+#include <exception>
 #include <filesystem>
 #include <queue>
 #include <string>
@@ -124,30 +125,42 @@ std::vector<FileEntry> scan_top_files(const std::wstring& drive, int topN, std::
         fs::directory_options::skip_permission_denied,
         ec
     );
+    fs::recursive_directory_iterator end;
 
-    if (ec) {
+    if (ec || it == end) {
         err = L"Could not access selected drive.";
         return {};
     }
 
-    for (const auto& entry : it) {
+    while (it != end) {
+        const auto& entry = *it;
+
+        // Avoid recursion into reparse points (junctions) to reduce edge-case failures.
+        std::error_code symlinkEc;
+        if (entry.is_symlink(symlinkEc)) {
+            it.disable_recursion_pending();
+        }
+
         std::error_code statusEc;
-        if (!entry.is_regular_file(statusEc) || statusEc) {
-            continue;
+        if (entry.is_regular_file(statusEc) && !statusEc) {
+            std::error_code sizeEc;
+            auto size = entry.file_size(sizeEc);
+            if (!sizeEc) {
+                FileEntry candidate{entry.path().wstring(), static_cast<std::uintmax_t>(size)};
+                if (static_cast<int>(heap.size()) < topN) {
+                    heap.push(std::move(candidate));
+                } else if (candidate.size > heap.top().size) {
+                    heap.pop();
+                    heap.push(std::move(candidate));
+                }
+            }
         }
 
-        std::error_code sizeEc;
-        auto size = entry.file_size(sizeEc);
-        if (sizeEc) {
-            continue;
-        }
-
-        FileEntry candidate{entry.path().wstring(), static_cast<std::uintmax_t>(size)};
-        if (static_cast<int>(heap.size()) < topN) {
-            heap.push(std::move(candidate));
-        } else if (candidate.size > heap.top().size) {
-            heap.pop();
-            heap.push(std::move(candidate));
+        std::error_code incEc;
+        it.increment(incEc);
+        if (incEc) {
+            // Ignore inaccessible entries and continue scanning.
+            incEc.clear();
         }
     }
 
@@ -167,7 +180,15 @@ DWORD WINAPI scan_worker(LPVOID param) {
     auto* request = static_cast<std::pair<std::wstring, int>*>(param);
     auto* out = new ScanResult{};
     out->drive = request->first;
-    out->files = scan_top_files(request->first, request->second, out->error);
+    try {
+        out->files = scan_top_files(request->first, request->second, out->error);
+    } catch (const fs::filesystem_error&) {
+        out->error = L"Filesystem error while scanning. Try a smaller folder first.";
+    } catch (const std::exception&) {
+        out->error = L"Unexpected error while scanning.";
+    } catch (...) {
+        out->error = L"Unknown error while scanning.";
+    }
     delete request;
     PostMessageW(g_app.hwnd, WM_SCAN_DONE, 0, reinterpret_cast<LPARAM>(out));
     return 0;
